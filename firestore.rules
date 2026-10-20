@@ -1,0 +1,238 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() > 0 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isOwner() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'owner';
+    }
+
+    function isWorker() {
+      return isSignedIn() &&
+        exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'worker';
+    }
+
+    function canAddProducts() {
+      return isOwner() || (
+        isWorker() &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.canAddProducts == true
+      );
+    }
+
+    // Entity Validations
+    function isValidUser(data) {
+      return data.uid is string && data.uid.size() <= 128 &&
+             data.email is string && data.email.size() <= 128 &&
+             data.role in ['owner', 'worker'];
+    }
+
+    function isValidProduct(data) {
+      return data.name is string && data.name.size() > 0 && data.name.size() <= 150 &&
+             data.sku is string && data.sku.size() <= 64 &&
+             data.brand is string && data.brand.size() <= 100 &&
+             data.size is string && data.size.size() <= 100 &&
+             data.purchasePrice is number && data.purchasePrice >= 0 &&
+             data.sellingPrice is number && data.sellingPrice >= 0 &&
+             data.currentStock is number;
+    }
+
+    function isValidCustomer(data) {
+      return data.shopName is string && data.shopName.size() > 0 && data.shopName.size() <= 150 &&
+             data.customerName is string && data.customerName.size() <= 150 &&
+             data.phone is string && data.phone.size() <= 30 &&
+             data.currentBalance is number;
+    }
+
+    function isValidSupplier(data) {
+      return data.companyName is string && data.companyName.size() > 0 && data.companyName.size() <= 150 &&
+             data.phone is string && data.phone.size() <= 30 &&
+             data.currentBalance is number;
+    }
+
+    function isValidSale(data) {
+      return data.invoiceNumber is string && data.invoiceNumber.size() <= 64 &&
+             data.customerId is string && data.customerId.size() <= 128 &&
+             data.totalAmount is number && data.totalAmount >= 0 &&
+             data.paidAmount is number && data.paidAmount >= 0 &&
+             data.remainingAmount is number &&
+             data.createdBy == request.auth.uid;
+    }
+
+    function isValidPayment(data) {
+      return data.type in ['customer_payment', 'supplier_payment'] &&
+             data.partyId is string && data.partyId.size() <= 128 &&
+             data.amount is number && data.amount > 0 &&
+             data.createdBy == request.auth.uid;
+    }
+
+    function isValidExpense(data) {
+      return data.title is string && data.title.size() > 0 && data.title.size() <= 150 &&
+             data.category in ['transport', 'rent', 'electricity', 'salaries', 'fuel', 'repairs', 'tea_refreshment', 'utility_bills', 'taxes', 'formality', 'packaging', 'other'] &&
+             (!('expenseType' in data) || data.expenseType in ['fixed', 'variable']) &&
+             data.amount is number && data.amount > 0 &&
+             data.createdBy == request.auth.uid;
+    }
+
+    function isValidAuditLog(data) {
+      return data.userId == request.auth.uid &&
+             data.action is string && data.action.size() <= 100 &&
+             data.details is string && data.details.size() <= 500;
+    }
+
+    function isValidInventoryTx(data) {
+      return data.productId is string && data.productId.size() <= 128 &&
+             data.type in ['purchase', 'sale', 'customer_return', 'supplier_return', 'manual_adjustment'] &&
+             data.quantity is number &&
+             data.prevStock is number &&
+             data.newStock is number &&
+             data.createdBy == request.auth.uid;
+    }
+
+    function isValidTreasuryTx(data) {
+      return data.type in ['inflow', 'outflow'] &&
+             data.amount is number && data.amount > 0 &&
+             data.category is string &&
+             data.createdBy == request.auth.uid;
+    }
+
+    function isValidCustomerReturn(data) {
+      return data.returnNumber is string &&
+             data.customerId is string &&
+             data.totalRefundAmount is number && data.totalRefundAmount >= 0 &&
+             data.refundMethod in ['cash', 'ledger_adjustment'] &&
+             data.createdBy == request.auth.uid;
+    }
+
+    // 1. Users Collection
+    match /users/{userId} {
+      allow get: if isSignedIn() && (request.auth.uid == userId || isOwner());
+      allow list: if isOwner();
+      allow create: if isSignedIn() && isValidId(userId) && isValidUser(incoming()) && (
+        isOwner() || request.auth.uid == userId
+      );
+      allow update: if isSignedIn() && isValidId(userId) && isValidUser(incoming()) && (
+        isOwner() ||
+        (request.auth.uid == userId && incoming().role == existing().role)
+      );
+      allow delete: if isOwner() && request.auth.uid != userId;
+    }
+
+    // 2. Products Collection
+    match /products/{productId} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(productId) && isValidProduct(incoming()) && canAddProducts();
+      allow update: if isSignedIn() && isValidId(productId) && isValidProduct(incoming()) && (
+        isOwner() ||
+        // Worker updating currentStock during sale/return
+        incoming().diff(existing()).affectedKeys().hasOnly(['currentStock', 'updatedAt'])
+      );
+      allow delete: if isOwner();
+    }
+
+    // 3. Inventory Transactions
+    match /inventoryTransactions/{txId} {
+      allow get: if isSignedIn() && (isOwner() || existing().createdBy == request.auth.uid);
+      allow list: if isOwner() || (isSignedIn() && resource.data.createdBy == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(txId) && isValidInventoryTx(incoming());
+      allow update, delete: if false; // Immutable ledger
+    }
+
+    // 4. Customers Collection
+    match /customers/{customerId} {
+      allow get, list: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(customerId) && isValidCustomer(incoming());
+      allow update: if isSignedIn() && isValidId(customerId) && isValidCustomer(incoming());
+      allow delete: if isOwner();
+    }
+
+    // 5. Suppliers Collection (Owner only write, signed in read for catalog brand linking)
+    match /suppliers/{supplierId} {
+      allow read: if isSignedIn();
+      allow write: if isOwner() && isValidId(supplierId);
+    }
+
+    // 6. Purchases Collection (Owner only)
+    match /purchases/{purchaseId} {
+      allow read: if isOwner();
+      allow write: if isOwner() && isValidId(purchaseId);
+    }
+
+    // 7. Sales Collection
+    match /sales/{saleId} {
+      allow get: if isSignedIn() && (isOwner() || existing().createdBy == request.auth.uid);
+      allow list: if isOwner() || (isSignedIn() && resource.data.createdBy == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(saleId) && isValidSale(incoming());
+      allow update, delete: if isOwner();
+    }
+
+    // 8. Payments Collection
+    match /payments/{paymentId} {
+      allow get: if isSignedIn() && (isOwner() || existing().createdBy == request.auth.uid);
+      allow list: if isOwner() || (isSignedIn() && resource.data.createdBy == request.auth.uid);
+      allow create: if isSignedIn() && isValidId(paymentId) && isValidPayment(incoming()) && (
+        isOwner() || (isWorker() && incoming().type == 'customer_payment')
+      );
+      allow update, delete: if isOwner();
+    }
+
+    // 9. Expenses Collection (Owner only)
+    match /expenses/{expenseId} {
+      allow read: if isOwner();
+      allow create: if isOwner() && isValidId(expenseId) && isValidExpense(incoming());
+      allow update, delete: if isOwner();
+    }
+
+    // 10. Audit Logs Collection
+    match /auditLogs/{logId} {
+      allow read: if isOwner();
+      allow create: if isSignedIn() && isValidId(logId) && isValidAuditLog(incoming());
+      allow update: if false;
+      allow delete: if isOwner();
+    }
+
+    // 11. Settings Collection
+    match /settings/{settingId} {
+      allow read: if isSignedIn();
+      allow write: if isOwner() && isValidId(settingId);
+    }
+
+    // 12. Treasury Transactions Collection (Markazi Account Ledger)
+    match /treasuryTransactions/{txId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(txId) && isValidTreasuryTx(incoming());
+      allow update, delete: if isOwner();
+    }
+
+    // 13. Customer Returns Collection (Sales Returns & Restock)
+    match /customerReturns/{returnId} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn() && isValidId(returnId) && isValidCustomerReturn(incoming());
+      allow update, delete: if isOwner();
+    }
+  }
+}

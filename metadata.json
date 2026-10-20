@@ -1,0 +1,7 @@
+{
+  "name": "Asaan Mattress POS & Inventory",
+  "description": "Modern POS, Inventory & Finance Management Web App for mattress wholesale and distribution in Pakistan (PKR).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
+
